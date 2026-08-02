@@ -1,5 +1,8 @@
 """
 Loads generated sample data files into Oracle RAW schema tables.
+Uses AUDIT.ETL_WATERMARK for incremental extraction on sources that have
+an updated_at field (customers, products, orders). Watermark is only
+advanced after the full run succeeds.
 
 Usage:
     python src/ingestion/load_raw.py
@@ -10,6 +13,7 @@ import hashlib
 import json
 import os
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import oracledb
@@ -19,6 +23,7 @@ load_dotenv()
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "sample"
 BATCH_ID = str(uuid.uuid4())
+PIPELINE_NAME = "ingest_sales_sources"
 
 DSN = f"{os.getenv('ORACLE_HOST')}:{os.getenv('ORACLE_PORT')}/{os.getenv('ORACLE_SERVICE_NAME')}"
 
@@ -32,37 +37,97 @@ def connect(user: str, password: str):
     return oracledb.connect(user=user, password=password, dsn=DSN)
 
 
-def load_json(conn, filename, table, columns, source_system, include_hash=True):
+def get_watermark(conn, source_name: str):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT last_successful_timestamp
+        FROM audit_owner.ETL_WATERMARK
+        WHERE pipeline_name = :pipeline_name AND source_name = :source_name
+        """,
+        pipeline_name=PIPELINE_NAME,
+        source_name=source_name,
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+def set_watermark(conn, source_name: str, ts: datetime):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        MERGE INTO audit_owner.ETL_WATERMARK tgt
+        USING (SELECT :pipeline_name AS pipeline_name, :source_name AS source_name FROM dual) src
+        ON (tgt.pipeline_name = src.pipeline_name AND tgt.source_name = src.source_name)
+        WHEN MATCHED THEN UPDATE SET
+            last_successful_timestamp = :ts, updated_at = SYSTIMESTAMP
+        WHEN NOT MATCHED THEN INSERT (pipeline_name, source_name, last_successful_timestamp, updated_at)
+        VALUES (:pipeline_name, :source_name, :ts, SYSTIMESTAMP)
+        """,
+        pipeline_name=PIPELINE_NAME,
+        source_name=source_name,
+        ts=ts,
+    )
+    conn.commit()
+
+
+def parse_updated_at(value: str) -> datetime:
+    return datetime.fromisoformat(value).replace(microsecond=0)
+
+def filter_incremental(records, watermark):
+    if watermark is None:
+        return records
+    return [r for r in records if parse_updated_at(r["updated_at"]) > watermark]
+
+
+def load_json(conn, filename, table, columns, source_system, incremental=False):
     with open(DATA_DIR / filename, "r", encoding="utf-8") as f:
         records = json.load(f)
 
-    extra_cols = ["source_file", "source_system", "batch_id"]
-    if include_hash:
-        extra_cols.append("record_hash")
-    cols = columns + extra_cols
+    watermark = get_watermark(conn, source_system) if incremental else None
+    if incremental:
+        records = filter_incremental(records, watermark)
 
+    if not records:
+        print(f"{filename} -> 0 new rows (watermark: {watermark})")
+        return
+
+    cols = columns + ["source_file", "source_system", "batch_id", "record_hash"]
     placeholders = ", ".join(f":{i+1}" for i in range(len(cols)))
     sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})"
 
     cur = conn.cursor()
     rows = []
+    max_updated_at = watermark
     for r in records:
         values = [str(r.get(c)) if r.get(c) is not None else None for c in columns]
-        values += [filename, source_system, BATCH_ID]
-        if include_hash:
-            values.append(record_hash(r))
+        values += [filename, source_system, BATCH_ID, record_hash(r)]
         rows.append(values)
+        if incremental:
+            ts = parse_updated_at(r["updated_at"])
+            if max_updated_at is None or ts > max_updated_at:
+                max_updated_at = ts
 
     cur.executemany(sql, rows)
     conn.commit()
-    print(f"{filename} -> {len(rows)} rows loaded into {table}")
+    print(f"{filename} -> {len(rows)} new rows loaded into {table}")
+
+    if incremental and max_updated_at:
+        set_watermark(conn, source_system, max_updated_at)
 
 
-def load_csv(conn, filename, table, columns, source_system, include_hash=True):
+def load_csv(conn, filename, table, columns, source_system, include_hash=True, incremental=False):
     with open(DATA_DIR / filename, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         records = list(reader)
 
+    watermark = get_watermark(conn, source_system) if incremental else None
+    if incremental:
+        records = filter_incremental(records, watermark)
+
+    if not records:
+        print(f"{filename} -> 0 new rows (watermark: {watermark})")
+        return
+
     extra_cols = ["source_file", "source_system", "batch_id"]
     if include_hash:
         extra_cols.append("record_hash")
@@ -73,27 +138,37 @@ def load_csv(conn, filename, table, columns, source_system, include_hash=True):
 
     cur = conn.cursor()
     rows = []
+    max_updated_at = watermark
     for r in records:
         values = [r.get(c) if r.get(c) != "" else None for c in columns]
         values += [filename, source_system, BATCH_ID]
         if include_hash:
             values.append(record_hash(r))
         rows.append(values)
+        if incremental:
+            ts = parse_updated_at(r["updated_at"])
+            if max_updated_at is None or ts > max_updated_at:
+                max_updated_at = ts
 
     cur.executemany(sql, rows)
     conn.commit()
-    print(f"{filename} -> {len(rows)} rows loaded into {table}")
+    print(f"{filename} -> {len(rows)} new rows loaded into {table}")
+
+    if incremental and max_updated_at:
+        set_watermark(conn, source_system, max_updated_at)
 
 
 def main():
     print(f"Batch ID: {BATCH_ID}\n")
     conn = connect("raw_owner", os.getenv("ORACLE_RAW_PASSWORD", "RawPass2026"))
 
+    # --- incremental sources (have updated_at) ---
     load_json(
         conn, "customers.json", "CUSTOMERS",
         ["customer_id", "first_name", "last_name", "email", "phone", "city",
          "country", "registration_date", "customer_segment", "updated_at"],
         "customers_json",
+        incremental=True,
     )
 
     load_csv(
@@ -101,13 +176,7 @@ def main():
         ["product_id", "product_name", "category", "subcategory", "brand",
          "supplier_id", "unit_cost", "list_price", "active_flag", "updated_at"],
         "products_csv",
-    )
-
-    load_csv(
-        conn, "stores.csv", "STORES",
-        ["store_id", "store_name", "store_type", "city", "country", "region", "opening_date"],
-        "stores_csv",
-        include_hash=False,
+        incremental=True,
     )
 
     load_json(
@@ -115,6 +184,15 @@ def main():
         ["order_id", "customer_id", "store_id", "order_date", "order_status",
          "currency", "total_amount", "created_at", "updated_at"],
         "orders_api",
+        incremental=True,
+    )
+
+    # --- full-extract sources (no updated_at field available) ---
+    load_csv(
+        conn, "stores.csv", "STORES",
+        ["store_id", "store_name", "store_type", "city", "country", "region", "opening_date"],
+        "stores_csv",
+        include_hash=False,
     )
 
     load_csv(
