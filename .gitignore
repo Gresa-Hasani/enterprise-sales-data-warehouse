@@ -1,0 +1,54 @@
+# --- Python ---
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# --- Environment / secrets ---
+.env
+*.env.local
+
+# --- Airflow ---
+airflow/logs/
+airflow/airflow.db
+airflow/airflow.cfg
+airflow/webserver_config.py
+airflow/plugins/__pycache__/
+airflow/standalone_admin_password.txt
+
+# --- dbt ---
+dbt_packages/
+target/
+logs/
+.dbt/
+
+# --- Docker ---
+*.pid
+
+# --- Generated / large data files (keep structure, not content) ---
+data/sample/*
+!data/sample/.gitkeep
+data/generated/
+
+# --- Great Expectations ---
+great_expectations/uncommitted/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.iml
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Logs ---
+*.log
+
+# --- Power BI (binary files, opsionale nëse s'do t'i versionosh) ---
+*.pbix

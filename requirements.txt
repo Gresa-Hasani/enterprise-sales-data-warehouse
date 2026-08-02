@@ -1,0 +1,31 @@
+# --- Data generation ---
+faker==33.1.0
+
+# --- Data processing ---
+pandas==2.2.3
+numpy==2.2.1
+openpyxl==3.1.5
+
+# --- Oracle connectivity (thin mode, no Instant Client needed) ---
+oracledb==2.5.1
+
+# --- HTTP / API ---
+requests==2.32.3
+
+# --- Config ---
+python-dotenv==1.0.1
+
+# --- Testing ---
+pytest==8.3.4
+pytest-mock==3.14.0
+
+# --- Data quality ---
+great-expectations==1.19.1
+
+# --- dbt (only if you go the Postgres-for-dev route) ---
+dbt-core==1.9.1
+dbt-postgres==1.9.0
+
+# --- Airflow: NOT installed here — it runs inside Docker via docker-compose.
+# Installing apache-airflow locally on Windows with Python 3.13 will very
+# likely fail (Airflow's constraint files only support up to 3.12).
