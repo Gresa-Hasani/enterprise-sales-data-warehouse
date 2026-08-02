@@ -1,10 +1,10 @@
 """
 Loads generated sample data files into Oracle RAW schema tables.
-Uses AUDIT.ETL_WATERMARK for incremental extraction on sources that have
-an updated_at field (customers, products, orders). Watermark is only
-advanced after the full run succeeds.
+Refactored into per-source callables so each can run as an independent
+Airflow task. Uses AUDIT.ETL_WATERMARK for incremental extraction on
+sources with an updated_at field (customers, products, orders).
 
-Usage:
+CLI usage (manual full run):
     python src/ingestion/load_raw.py
 """
 
@@ -22,7 +22,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "sample"
-BATCH_ID = str(uuid.uuid4())
 PIPELINE_NAME = "ingest_sales_sources"
 
 DSN = f"{os.getenv('ORACLE_HOST')}:{os.getenv('ORACLE_PORT')}/{os.getenv('ORACLE_SERVICE_NAME')}"
@@ -35,6 +34,10 @@ def record_hash(record: dict) -> str:
 
 def connect(user: str, password: str):
     return oracledb.connect(user=user, password=password, dsn=DSN)
+
+
+def _raw_connect():
+    return connect("raw_owner", os.getenv("ORACLE_RAW_PASSWORD", "RawPass2026"))
 
 
 def get_watermark(conn, source_name: str):
@@ -50,6 +53,7 @@ def get_watermark(conn, source_name: str):
     )
     row = cur.fetchone()
     return row[0] if row else None
+
 
 def set_watermark(conn, source_name: str, ts: datetime):
     cur = conn.cursor()
@@ -73,13 +77,14 @@ def set_watermark(conn, source_name: str, ts: datetime):
 def parse_updated_at(value: str) -> datetime:
     return datetime.fromisoformat(value).replace(microsecond=0)
 
+
 def filter_incremental(records, watermark):
     if watermark is None:
         return records
     return [r for r in records if parse_updated_at(r["updated_at"]) > watermark]
 
 
-def load_json(conn, filename, table, columns, source_system, incremental=False):
+def load_json(conn, filename, table, columns, source_system, batch_id, incremental=False):
     with open(DATA_DIR / filename, "r", encoding="utf-8") as f:
         records = json.load(f)
 
@@ -89,7 +94,7 @@ def load_json(conn, filename, table, columns, source_system, incremental=False):
 
     if not records:
         print(f"{filename} -> 0 new rows (watermark: {watermark})")
-        return
+        return 0
 
     cols = columns + ["source_file", "source_system", "batch_id", "record_hash"]
     placeholders = ", ".join(f":{i+1}" for i in range(len(cols)))
@@ -100,7 +105,7 @@ def load_json(conn, filename, table, columns, source_system, incremental=False):
     max_updated_at = watermark
     for r in records:
         values = [str(r.get(c)) if r.get(c) is not None else None for c in columns]
-        values += [filename, source_system, BATCH_ID, record_hash(r)]
+        values += [filename, source_system, batch_id, record_hash(r)]
         rows.append(values)
         if incremental:
             ts = parse_updated_at(r["updated_at"])
@@ -114,8 +119,10 @@ def load_json(conn, filename, table, columns, source_system, incremental=False):
     if incremental and max_updated_at:
         set_watermark(conn, source_system, max_updated_at)
 
+    return len(rows)
 
-def load_csv(conn, filename, table, columns, source_system, include_hash=True, incremental=False):
+
+def load_csv(conn, filename, table, columns, source_system, batch_id, include_hash=True, incremental=False):
     with open(DATA_DIR / filename, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         records = list(reader)
@@ -126,7 +133,7 @@ def load_csv(conn, filename, table, columns, source_system, include_hash=True, i
 
     if not records:
         print(f"{filename} -> 0 new rows (watermark: {watermark})")
-        return
+        return 0
 
     extra_cols = ["source_file", "source_system", "batch_id"]
     if include_hash:
@@ -141,7 +148,7 @@ def load_csv(conn, filename, table, columns, source_system, include_hash=True, i
     max_updated_at = watermark
     for r in records:
         values = [r.get(c) if r.get(c) != "" else None for c in columns]
-        values += [filename, source_system, BATCH_ID]
+        values += [filename, source_system, batch_id]
         if include_hash:
             values.append(record_hash(r))
         rows.append(values)
@@ -157,67 +164,138 @@ def load_csv(conn, filename, table, columns, source_system, include_hash=True, i
     if incremental and max_updated_at:
         set_watermark(conn, source_system, max_updated_at)
 
+    return len(rows)
+
+
+def extract_customers(batch_id: str) -> int:
+    conn = _raw_connect()
+    try:
+        return load_json(
+            conn, "customers.json", "CUSTOMERS",
+            ["customer_id", "first_name", "last_name", "email", "phone", "city",
+             "country", "registration_date", "customer_segment", "updated_at"],
+            "customers_json", batch_id, incremental=True,
+        )
+    finally:
+        conn.close()
+
+
+def extract_products(batch_id: str) -> int:
+    conn = _raw_connect()
+    try:
+        return load_csv(
+            conn, "products.csv", "PRODUCTS",
+            ["product_id", "product_name", "category", "subcategory", "brand",
+             "supplier_id", "unit_cost", "list_price", "active_flag", "updated_at"],
+            "products_csv", batch_id, incremental=True,
+        )
+    finally:
+        conn.close()
+
+
+def extract_orders(batch_id: str) -> int:
+    conn = _raw_connect()
+    try:
+        return load_json(
+            conn, "orders.json", "ORDERS",
+            ["order_id", "customer_id", "store_id", "order_date", "order_status",
+             "currency", "total_amount", "created_at", "updated_at"],
+            "orders_api", batch_id, incremental=True,
+        )
+    finally:
+        conn.close()
+
+
+def extract_order_items(batch_id: str) -> int:
+    conn = _raw_connect()
+    try:
+        return load_csv(
+            conn, "order_items.csv", "ORDER_ITEMS",
+            ["order_item_id", "order_id", "product_id", "quantity", "unit_price",
+             "discount_amount", "tax_amount"],
+            "order_items_csv", batch_id,
+        )
+    finally:
+        conn.close()
+
+
+def extract_returns(batch_id: str) -> int:
+    conn = _raw_connect()
+    try:
+        return load_csv(
+            conn, "returns.csv", "RETURNS",
+            ["return_id", "order_item_id", "return_date", "return_reason",
+             "return_quantity", "refund_amount"],
+            "returns_csv", batch_id,
+        )
+    finally:
+        conn.close()
+
+
+def extract_stores(batch_id: str) -> int:
+    conn = _raw_connect()
+    try:
+        return load_csv(
+            conn, "stores.csv", "STORES",
+            ["store_id", "store_name", "store_type", "city", "country", "region", "opening_date"],
+            "stores_csv", batch_id, include_hash=False,
+        )
+    finally:
+        conn.close()
+
+
+def extract_sales_targets(batch_id: str) -> int:
+    conn = _raw_connect()
+    try:
+        return load_csv(
+            conn, "sales_targets.csv", "SALES_TARGETS",
+            ["store_id", "year", "month", "sales_target", "profit_target"],
+            "sales_targets_csv", batch_id, include_hash=False,
+        )
+    finally:
+        conn.close()
+
+
+def record_etl_run(batch_id, start_time, end_time, status, rows_extracted, error_message=None):
+    conn = connect("audit_owner", os.getenv("ORACLE_AUDIT_PASSWORD", "AuditPass2026"))
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO ETL_RUN
+                (pipeline_name, batch_id, start_time, end_time, status,
+                 rows_extracted, rows_loaded, rows_rejected, error_message)
+            VALUES
+                (:pipeline_name, :batch_id, :start_time, :end_time, :status,
+                 :rows_extracted, :rows_extracted, 0, :error_message)
+            """,
+            pipeline_name=PIPELINE_NAME,
+            batch_id=batch_id,
+            start_time=start_time,
+            end_time=end_time,
+            status=status,
+            rows_extracted=rows_extracted,
+            error_message=error_message,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def main():
-    print(f"Batch ID: {BATCH_ID}\n")
-    conn = connect("raw_owner", os.getenv("ORACLE_RAW_PASSWORD", "RawPass2026"))
+    batch_id = str(uuid.uuid4())
+    print(f"Batch ID: {batch_id}\n")
 
-    # --- incremental sources (have updated_at) ---
-    load_json(
-        conn, "customers.json", "CUSTOMERS",
-        ["customer_id", "first_name", "last_name", "email", "phone", "city",
-         "country", "registration_date", "customer_segment", "updated_at"],
-        "customers_json",
-        incremental=True,
-    )
+    total = 0
+    total += extract_customers(batch_id)
+    total += extract_products(batch_id)
+    total += extract_orders(batch_id)
+    total += extract_stores(batch_id)
+    total += extract_order_items(batch_id)
+    total += extract_returns(batch_id)
+    total += extract_sales_targets(batch_id)
 
-    load_csv(
-        conn, "products.csv", "PRODUCTS",
-        ["product_id", "product_name", "category", "subcategory", "brand",
-         "supplier_id", "unit_cost", "list_price", "active_flag", "updated_at"],
-        "products_csv",
-        incremental=True,
-    )
-
-    load_json(
-        conn, "orders.json", "ORDERS",
-        ["order_id", "customer_id", "store_id", "order_date", "order_status",
-         "currency", "total_amount", "created_at", "updated_at"],
-        "orders_api",
-        incremental=True,
-    )
-
-    # --- full-extract sources (no updated_at field available) ---
-    load_csv(
-        conn, "stores.csv", "STORES",
-        ["store_id", "store_name", "store_type", "city", "country", "region", "opening_date"],
-        "stores_csv",
-        include_hash=False,
-    )
-
-    load_csv(
-        conn, "order_items.csv", "ORDER_ITEMS",
-        ["order_item_id", "order_id", "product_id", "quantity", "unit_price",
-         "discount_amount", "tax_amount"],
-        "order_items_csv",
-    )
-
-    load_csv(
-        conn, "returns.csv", "RETURNS",
-        ["return_id", "order_item_id", "return_date", "return_reason",
-         "return_quantity", "refund_amount"],
-        "returns_csv",
-    )
-
-    load_csv(
-        conn, "sales_targets.csv", "SALES_TARGETS",
-        ["store_id", "year", "month", "sales_target", "profit_target"],
-        "sales_targets_csv",
-        include_hash=False,
-    )
-
-    conn.close()
-    print("\nDone.")
+    print(f"\nDone. Total new rows loaded: {total}")
 
 
 if __name__ == "__main__":

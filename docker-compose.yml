@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   oracle:
     image: gvenzl/oracle-xe:21-slim
@@ -21,5 +19,79 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  postgres:
+    image: postgres:13
+    container_name: nova_airflow_meta
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  airflow-init:
+    image: apache/airflow:2.9.3
+    container_name: nova_airflow_init
+    depends_on:
+      - postgres
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      _PIP_ADDITIONAL_REQUIREMENTS: "oracledb python-dotenv"
+    entrypoint: /bin/bash
+    command: >
+      -c "airflow db init &&
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com"
+
+  airflow-webserver:
+    image: apache/airflow:2.9.3
+    container_name: nova_airflow_web
+    depends_on:
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      _PIP_ADDITIONAL_REQUIREMENTS: "oracledb python-dotenv"
+      ORACLE_HOST: oracle
+      ORACLE_PORT: 1521
+      ORACLE_SERVICE_NAME: XEPDB1
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+      - ./sql:/opt/airflow/sql
+      - ./.env:/opt/airflow/.env
+    ports:
+      - "8080:8080"
+    command: webserver
+    restart: unless-stopped
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.3
+    container_name: nova_airflow_scheduler
+    depends_on:
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      _PIP_ADDITIONAL_REQUIREMENTS: "oracledb python-dotenv"
+      ORACLE_HOST: oracle
+      ORACLE_PORT: 1521
+      ORACLE_SERVICE_NAME: XEPDB1
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+      - ./sql:/opt/airflow/sql
+      - ./.env:/opt/airflow/.env
+    command: scheduler
+    restart: unless-stopped
 volumes:
   oracle_data:
+  postgres_data:
