@@ -1,0 +1,2 @@
+SET TIMING ON;
+SELECT COUNT(*), SUM(net_amount) FROM FACT_SALES WHERE store_key = 5;
