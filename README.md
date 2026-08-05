@@ -1,8 +1,8 @@
-# Enterprise Sales Data Warehouse — NovaRetail Analytics
+# Enterprise Sales Data Warehouse 
 
 [![CI](https://github.com/Gresa-Hasani/enterprise-sales-data-warehouse/actions/workflows/ci.yml/badge.svg)](https://github.com/Gresa-Hasani/enterprise-sales-data-warehouse/actions/workflows/ci.yml)
 
-A full, end-to-end Enterprise Data Warehouse built for **NovaRetail Analytics**, a fictional retail company selling online and in physical stores. The project simulates a realistic multi-source retail environment (orders, customers, products, returns, stores, sales targets) and builds a complete pipeline from raw ingestion to BI dashboards, following standard data engineering practices: RAW/STG/DWH/MART layering, SCD Type 2 dimensions, incremental loading, data quality validation, orchestration, performance tuning, and CI/CD.
+A full, end-to-end Enterprise Data Warehouse built for a retail company selling online and in physical stores. The project simulates a realistic multi-source retail environment (orders, customers, products, returns, stores, sales targets) and builds a complete pipeline from raw ingestion to BI dashboards, following standard data engineering practices: RAW/STG/DWH/MART layering, SCD Type 2 dimensions, incremental loading, data quality validation, orchestration, performance tuning, and CI/CD.
 
 ## Architecture
 
